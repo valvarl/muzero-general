@@ -3,6 +3,49 @@ from abc import ABC, abstractmethod
 
 import torch
 
+import logging
+# ... already have: import torch
+
+# Safe helper to wrap modules into DataParallel if and only if CUDA is usable.
+def safe_data_parallel(module):
+    """
+    Try to enable CUDA/DataParallel for `module`. If any error occurs (including
+    torch.cuda.is_available() raising), fallback to CPU-only module.
+    Returns a torch.nn.Module (possibly wrapped with DataParallel).
+    """
+    try:
+        # Guard the call to torch.cuda.is_available() which in your environment
+        # previously triggered a crash inside worker processes.
+        use_cuda = False
+        try:
+            use_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+        except Exception as e:
+            logging.warning("torch.cuda.is_available() raised: %s. Falling back to CPU-only.", e)
+            use_cuda = False
+
+        if use_cuda:
+            try:
+                # move module to cuda and wrap if multiple GPUs exist
+                module.to("cuda")
+                if torch.cuda.device_count() > 1:
+                    module = torch.nn.DataParallel(module)
+                logging.info("Using CUDA with %d devices", torch.cuda.device_count())
+            except Exception as e:
+                logging.warning("Enabling CUDA/DataParallel failed: %s. Falling back to CPU-only.", e)
+                try:
+                    module.to("cpu")
+                except Exception:
+                    pass
+        else:
+            logging.info("CUDA not used (CPU-only).")
+    except Exception as outer:
+        # In case anything unexpected happens, ensure we return module on CPU.
+        logging.exception("Unexpected error in safe_data_parallel: %s", outer)
+        try:
+            module.to("cpu")
+        except Exception:
+            pass
+    return module
 
 class MuZeroNetwork:
     def __new__(cls, config):
@@ -95,7 +138,7 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         self.action_space_size = action_space_size
         self.full_support_size = 2 * support_size + 1
 
-        self.representation_network = torch.nn.DataParallel(
+        self.representation_network = (
             mlp(
                 observation_shape[0]
                 * observation_shape[1]
@@ -107,21 +150,21 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
             )
         )
 
-        self.dynamics_encoded_state_network = torch.nn.DataParallel(
+        self.dynamics_encoded_state_network = (
             mlp(
                 encoding_size + self.action_space_size,
                 fc_dynamics_layers,
                 encoding_size,
             )
         )
-        self.dynamics_reward_network = torch.nn.DataParallel(
+        self.dynamics_reward_network = (
             mlp(encoding_size, fc_reward_layers, self.full_support_size)
         )
 
-        self.prediction_policy_network = torch.nn.DataParallel(
+        self.prediction_policy_network = (
             mlp(encoding_size, fc_policy_layers, self.action_space_size)
         )
-        self.prediction_value_network = torch.nn.DataParallel(
+        self.prediction_value_network = (
             mlp(encoding_size, fc_value_layers, self.full_support_size)
         )
 
@@ -483,7 +526,7 @@ class MuZeroResidualNetwork(AbstractNetwork):
             else (reduced_channels_policy * observation_shape[1] * observation_shape[2])
         )
 
-        self.representation_network = torch.nn.DataParallel(
+        self.representation_network = (
             RepresentationNetwork(
                 observation_shape,
                 stacked_observations,
@@ -493,7 +536,7 @@ class MuZeroResidualNetwork(AbstractNetwork):
             )
         )
 
-        self.dynamics_network = torch.nn.DataParallel(
+        self.dynamics_network = (
             DynamicsNetwork(
                 num_blocks,
                 num_channels + 1,
@@ -504,7 +547,7 @@ class MuZeroResidualNetwork(AbstractNetwork):
             )
         )
 
-        self.prediction_network = torch.nn.DataParallel(
+        self.prediction_network = (
             PredictionNetwork(
                 action_space_size,
                 num_blocks,
