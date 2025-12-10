@@ -435,7 +435,7 @@ class MuZero:
         # Load checkpoint
         if checkpoint_path:
             checkpoint_path = pathlib.Path(checkpoint_path)
-            self.checkpoint = torch.load(checkpoint_path)
+            self.checkpoint = torch.load(checkpoint_path, weights_only=False)
             print(f"\nUsing checkpoint from {checkpoint_path}")
 
         # Load replay buffer
