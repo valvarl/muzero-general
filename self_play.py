@@ -16,7 +16,7 @@ class SelfPlay:
 
     def __init__(self, initial_checkpoint, Game, config, seed):
         self.config = config
-        self.game = Game(seed)
+        self.game = Game(num_players=2, seed=seed)
 
         # Fix random generator seed
         numpy.random.seed(seed)
@@ -327,11 +327,15 @@ class MCTS:
                 action, node = self.select_child(node, min_max_stats)
                 search_path.append(node)
 
-                # Players play turn by turn
-                if virtual_to_play + 1 < len(self.config.players):
-                    virtual_to_play = self.config.players[virtual_to_play + 1]
-                else:
-                    virtual_to_play = self.config.players[0]
+                # # Players play turn by turn
+                # if virtual_to_play + 1 < len(self.config.players):
+                #     virtual_to_play = self.config.players[virtual_to_play + 1]
+                # else:
+                #     virtual_to_play = self.config.players[0]
+
+                # Dominion (and other multi-decision-per-turn games) may keep the same to_play
+                # across multiple actions. Delegate turn logic to config hook.
+                virtual_to_play = self.config.next_to_play(virtual_to_play, action)
 
             # Inside the search tree we use the dynamics function to obtain the next hidden
             # state given an action and the previous hidden state
