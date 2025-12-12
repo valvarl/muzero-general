@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 import pathlib
 import random
 from typing import Dict, List, Optional, Set
@@ -38,9 +39,13 @@ ACTION_SPACE_SIZE = 2 * N_CARDS + 5
 
 # ----------------- Reward shaping config -----------------
 # 0.25 * Δ(VP_diff) за шаг, небольшой штраф за ошибку и за длину партии.
-REWARD_VP_DIFF_SCALE = 0.25      # шаговый шейпинг: 0.25 * (VP_diff_after - VP_diff_before)
+#REWARD_VP_DIFF_SCALE = 0.25      # шаговый шейпинг: 0.25 * (VP_diff_after - VP_diff_before)
 REWARD_ILLEGAL_ACTION = -0.1     # небольшой штраф за нелегальное действие
-REWARD_STEP_PENALTY = -0.002     # штраф за "затягивание" партии на каждый шаг
+REWARD_STEP_PENALTY = -0.0005     # штраф за "затягивание" партии на каждый шаг
+
+# Potential-based VP shaping
+REWARD_SHAPING_NORM   = 6.0    # 6 VP = Province
+REWARD_SHAPING_ALPHA  = 0.1    # alpha, о которой мы говорили
 
 # ----------------- MuZero-like config -----------------
 class MuZeroConfig:
@@ -48,11 +53,11 @@ class MuZeroConfig:
         self.seed = 0
         self.max_num_gpus = None
 
-        self.observation_shape = (1, 1, 169)  # set by adapter
+        self.observation_shape = (1, 1, 170)  # set by adapter
         self.action_space = list(range(ACTION_SPACE_SIZE))
 
         # true 2-player env
-        self.players = [0]
+        self.players = [0, 1]
         self.stacked_observations = 0
 
         self.muzero_player = 0
@@ -62,7 +67,7 @@ class MuZeroConfig:
         self.selfplay_on_gpu = False
         self.max_moves = 600
         self.num_simulations = 50
-        self.discount = 1
+        self.discount = 0.997
         self.temperature_threshold = None
 
         self.root_dirichlet_alpha = 0.3
@@ -71,7 +76,7 @@ class MuZeroConfig:
         self.pb_c_init = 1.25
 
         self.network = "resnet"
-        self.support_size = 10
+        self.support_size = 15
 
         self.downsample = False
         self.blocks = 2
@@ -97,7 +102,7 @@ class MuZeroConfig:
             / datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
         )
         self.save_model = True
-        self.training_steps = 150000
+        self.training_steps = 500_000
         self.batch_size = 128
         self.checkpoint_interval = 10
         self.value_loss_weight = 0.25
@@ -107,13 +112,13 @@ class MuZeroConfig:
         self.weight_decay = 1e-4
         self.momentum = 0.9
 
-        self.lr_init = 0.03
+        self.lr_init = 0.01
         self.lr_decay_rate = 0.75
-        self.lr_decay_steps = 150000
+        self.lr_decay_steps = 500_000
 
         self.replay_buffer_size = 10000
         self.num_unroll_steps = 50
-        self.td_steps = 200
+        self.td_steps = 100
         self.PER = True
         self.PER_alpha = 0.5
 
@@ -125,15 +130,56 @@ class MuZeroConfig:
         self.ratio = None
 
     def next_to_play(self, current_to_play: int, action: int) -> int:
+        """
+        Решаем, какой логический игрок ходит в следующем узле дерева.
+
+        Правила:
+        - По умолчанию, пока ход не завершён, решения принимает тот же игрок.
+        - При END_TURN ход передаётся следующему игроку по кругу.
+        - При розыгрыше Militia / Bureaucrat в ACTION-фазе
+          следующая интерактивная фаза принадлежит жертве,
+          поэтому в виртуале переключаемся на оппонента.
+
+        Это приближённая модель (мы не знаем фактическое состояние среды
+        в MCTS), но роли атакующего и жертвы по крайней мере честно
+        разделены.
+        """
+
+        players = getattr(self, "players", None)
+        if not players:
+            return current_to_play
+
+        # 1) Конец хода: передаём ход следующему игроку по кругу.
+        if action == ACTION_END_TURN:
+            try:
+                idx = players.index(current_to_play)
+            except ValueError:
+                idx = current_to_play
+            return players[(idx + 1) % len(players)]
+
+        # 2) Розыгрыш атакующей карты, дающей решения оппоненту:
+        #    Militia / Bureaucrat.
+        if ACTION_SELECT_OFFSET <= action < ACTION_SELECT_OFFSET + N_CARDS:
+            card_name = ALL_CARDS[action - ACTION_SELECT_OFFSET]
+            if card_name in ("Militia", "Bureaucrat"):
+                try:
+                    idx = players.index(current_to_play)
+                except ValueError:
+                    idx = current_to_play
+                # передаём управление оппоненту (жертве)
+                return players[(idx + 1) % len(players)]
+
+        # 3) Во всех остальных случаях ходит тот же игрок.
         return current_to_play
 
     def visit_softmax_temperature_fn(self, trained_steps: int) -> float:
-        if trained_steps < 500e3:
-            return 1.0
-        elif trained_steps < 750e3:
-            return 0.5
+        # Под Dominion с training_steps ~ 500k
+        if trained_steps < 100e3:
+            return 1.0   # сильная стохастика в самом начале
+        elif trained_steps < 300e3:
+            return 0.5   # более жадный поиск на среднем этапе
         else:
-            return 0.25
+            return 0.25  # в конце почти всегда выбираем лучшую по визитам
 
 
 # ----------------- AdapterGame -----------------
@@ -168,13 +214,18 @@ class AdapterGame(AbstractGame):
         self.card_names: List[str] = sorted(list(self.dom.cards.keys()))
         self.n_card_types = len(self.card_names)
 
-        self.obs_len = self.n_card_types * 4 + self.n_card_types + 4
+        # 4 блока зон игрока + supply + 5 скаляров (actions, buys, coins, phase_flag, turn_number)
+        self.obs_len = self.n_card_types * 4 + self.n_card_types + 5
         self.observation_shape = (1, 1, self.obs_len)
 
         self.config = MuZeroConfig()
         self.config.observation_shape = self.observation_shape
+        # два игрока для zero-sum MCTS
+        self.config.players = list(range(self.num_players))
 
         self.last_actor: int = self.dom.to_play()
+        # Глобальный номер хода (инкремент при успешном END_TURN)
+        self.turn_number: int = 0
 
         # stable name->index mapping for actions
         self._all_cards: List[str] = list(ALL_CARDS)
@@ -216,11 +267,12 @@ class AdapterGame(AbstractGame):
         self.card_names = sorted(list(self.dom.cards.keys()))
         self.n_card_types = len(self.card_names)
 
-        self.obs_len = self.n_card_types * 4 + self.n_card_types + 4
+        self.obs_len = self.n_card_types * 4 + self.n_card_types + 5
         self.observation_shape = (1, 1, self.obs_len)
         self.config.observation_shape = self.observation_shape
 
         self.last_actor = self.dom.to_play()
+        self.turn_number = 0
         return self.get_observation()
 
     def close(self):
@@ -417,8 +469,8 @@ class AdapterGame(AbstractGame):
         self.last_actor = cur
         phase = self.dom.phase
 
-        # VP-разница ДО действия (с точки зрения текущего игрока)
-        vp_diff_before = self._vp_diff_for_player(cur)
+        # --- Potential до действия (Phi_before) ---
+        phi_before = self._state_potential(cur)
 
         ok = False
 
@@ -443,15 +495,20 @@ class AdapterGame(AbstractGame):
         # -------------- End turn --------------
         elif action == ACTION_END_TURN:
             ok = (phase == TurnPhase.BUY) and self.dom.end_turn_and_advance()
+            if ok:
+                # новый полный ход (переход к следующему игроку)
+                self.turn_number += 1
 
         # штраф за нелегальное действие
         if not ok:
             reward += REWARD_ILLEGAL_ACTION
 
-        # VP-разница ПОСЛЕ действия (всё ещё с точки зрения cur)
-        vp_diff_after = self._vp_diff_for_player(cur)
-        delta_diff = vp_diff_after - vp_diff_before
-        reward += REWARD_VP_DIFF_SCALE * delta_diff
+        # --- Potential после действия (Phi_after) ---
+        phi_after = self._state_potential(cur)
+
+        # Potential-based shaping: alpha * (Phi_after - Phi_before)
+        delta_phi = phi_after - phi_before
+        reward += REWARD_SHAPING_ALPHA * delta_phi
 
         # лёгкий штраф за длину партии
         reward += REWARD_STEP_PENALTY
@@ -682,7 +739,13 @@ class AdapterGame(AbstractGame):
 
         phase_flag = 1.0 if self.dom.phase == TurnPhase.BUY else 0.0
         scalars = np.array(
-            [float(self.dom.actions), float(self.dom.buys), float(self.dom.coins), phase_flag],
+            [
+                float(self.dom.actions),
+                float(self.dom.buys),
+                float(self.dom.coins),
+                phase_flag,
+                float(self.turn_number / self.config.max_moves)
+            ],
             dtype=np.float32,
         )
 
@@ -690,7 +753,7 @@ class AdapterGame(AbstractGame):
             [deck_counts, hand_counts, discard_counts, in_play_counts, supply_counts, scalars],
             axis=0,
         )
-        obs_len = self.n_card_types * 4 + self.n_card_types + 4
+        obs_len = self.n_card_types * 4 + self.n_card_types + 5
         assert vec.size == obs_len
         return vec.reshape((1, 1, obs_len)).astype(np.float32)
 
@@ -705,10 +768,19 @@ class AdapterGame(AbstractGame):
         my_score = float(scores.get(player_index, 0))
         others = [float(v) for k, v in scores.items() if k != player_index]
         if not others:
-            # на случай каких-то экзотических конфигураций, но в 2p Dominion это не должно случиться
             return 0.0
         best_other = max(others)
         return my_score - best_other
+    
+    def _state_potential(self, player_index: int) -> float:
+        """
+        Потенциал состояния для shaping:
+        Phi = tanh( vp_diff / REWARD_SHAPING_NORM )
+        Ограничивает вклад очень больших отрывов по VP.
+        """
+        vp_diff = self._vp_diff_for_player(player_index)
+        x = vp_diff / REWARD_SHAPING_NORM
+        return math.tanh(x)
 
     def _terminal_reward_for_last_actor(self) -> float:
         scores = self.dom.compute_scores()
