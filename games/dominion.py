@@ -112,7 +112,7 @@ class MuZeroConfig:
         self.weight_decay = 1e-4
         self.momentum = 0.9
 
-        self.lr_init = 0.01
+        self.lr_init = 0.03
         self.lr_decay_rate = 0.75
         self.lr_decay_steps = 500_000
 
@@ -231,6 +231,10 @@ class AdapterGame(AbstractGame):
         self._all_cards: List[str] = list(ALL_CARDS)
         self._name_to_all_idx: Dict[str, int] = {n: i for i, n in enumerate(self._all_cards)}
 
+        self._tb_stats = None
+        self._episode_index = 0
+
+
     def _sample_kingdom(self) -> List[str]:
         return self.rng.sample(BASE_2E_KINGDOM_CARDS, 10)
 
@@ -273,7 +277,129 @@ class AdapterGame(AbstractGame):
 
         self.last_actor = self.dom.to_play()
         self.turn_number = 0
+        self._episode_index += 1
+        self._tb_stats = self._init_episode_stats()
         return self.get_observation()
+
+    # ----------------- TensorBoard episode stats -----------------
+
+    def _init_episode_stats(self) -> dict:
+        # накопители за игру
+        return {
+            "episode": self._episode_index,
+
+            # 4) полные ходы (заканчиваются ACTION_END_TURN, у тебя это действие end_turn_and_advance())
+            "full_turns": 0,
+
+            # 7) суммарно не потраченные деньги на фазе покупки (на конец BUY перед end_turn)
+            "unspent_coins_sum": {0: 0.0, 1: 0.0},
+
+            # 8) среднее число action-карт, сыгранных в action-фазе
+            "actions_played_total": {0: 0, 1: 0},
+            "action_phases_count": {0: 0, 1: 0},
+            "actions_played_this_action_phase": {0: 0, 1: 0},
+
+            # 9) причина окончания игры
+            "ended_by_provinces": 0,
+            "ended_by_3_piles": 0,
+        }
+
+    def _player_all_cards(self, p) -> list:
+        # все карты игрока в сумме
+        return list(p.deck) + list(p.hand) + list(p.discard) + list(p.in_play)
+
+    def _count_card_name(self, p, name: str) -> int:
+        return sum(1 for c in self._player_all_cards(p) if c.name == name)
+
+    def _count_kingdom_cards(self, p) -> int:
+        # только 10 карт королевства текущей партии
+        kingdom_set = set(self.dom.kingdom)  # в dominion_base обычно хранится список имён
+        return sum(1 for c in self._player_all_cards(p) if c.name in kingdom_set)
+
+    def _treasure_value_sum(self, p) -> float:
+        # суммарная "стоимость сокровищ" в колоде игрока (по cost; если у тебя есть другой атрибут — поменяй)
+        total = 0.0
+        for c in self._player_all_cards(p):
+            if c.has_type(CardType.TREASURE):
+                total += float(getattr(c, "cost", 0))
+        return total
+
+    def _snapshot_endgame_metrics(self) -> dict:
+        # 1) VP у каждого игрока
+        scores = self.dom.compute_scores()  # {player_idx: vp}
+        out = {
+            "vp": {0: float(scores.get(0, 0)), 1: float(scores.get(1, 0))},
+        }
+
+        # 2) кол-во провинций у каждого игрока
+        out["provinces"] = {
+            0: float(self._count_card_name(self.dom.players[0], "Province")),
+            1: float(self._count_card_name(self.dom.players[1], "Province")),
+        }
+
+        # 3) кол-во карт у каждого игрока
+        out["cards_total"] = {
+            0: float(len(self._player_all_cards(self.dom.players[0]))),
+            1: float(len(self._player_all_cards(self.dom.players[1]))),
+        }
+
+        # 5) (сумма значений сокровищ) / (общее число карт) у каждого игрока
+        out["treasure_value_per_card"] = {}
+        for i in [0, 1]:
+            p = self.dom.players[i]
+            denom = max(1, len(self._player_all_cards(p)))
+            out["treasure_value_per_card"][i] = float(self._treasure_value_sum(p)) / float(denom)
+
+        # 6) кол-во карт из 10 уникальных королевских
+        out["kingdom_cards_total"] = {
+            0: float(self._count_kingdom_cards(self.dom.players[0])),
+            1: float(self._count_kingdom_cards(self.dom.players[1])),
+        }
+
+        # 7) накоплено в self._tb_stats["unspent_coins_sum"]
+        out["unspent_coins_sum"] = {
+            0: float(self._tb_stats["unspent_coins_sum"][0]),
+            1: float(self._tb_stats["unspent_coins_sum"][1]),
+        }
+
+        # 8) среднее actions played на action-phase
+        out["avg_actions_played_in_action_phase"] = {}
+        for i in [0, 1]:
+            n = self._tb_stats["action_phases_count"][i]
+            out["avg_actions_played_in_action_phase"][i] = (
+                float(self._tb_stats["actions_played_total"][i]) / float(max(1, n))
+            )
+
+        # 4) full turns
+        out["full_turns"] = float(self._tb_stats["full_turns"])
+
+        # 9) причина окончания
+        out["ended_by_provinces"] = float(self._tb_stats["ended_by_provinces"])
+        out["ended_by_3_piles"] = float(self._tb_stats["ended_by_3_piles"])
+        return out
+
+    def get_episode_tensorboard_scalars(self) -> dict:
+        """
+        Вызывать ТОЛЬКО когда done=True (после is_game_over()).
+        Возвращает плоский dict {tag: value} для TensorBoard.
+        """
+        snap = self._snapshot_endgame_metrics()
+
+        scalars = {}
+        for i in [0, 1]:
+            scalars[f"dominion/vp_p{i}"] = snap["vp"][i]
+            scalars[f"dominion/provinces_p{i}"] = snap["provinces"][i]
+            scalars[f"dominion/cards_total_p{i}"] = snap["cards_total"][i]
+            scalars[f"dominion/treasure_value_per_card_p{i}"] = snap["treasure_value_per_card"][i]
+            scalars[f"dominion/kingdom_cards_total_p{i}"] = snap["kingdom_cards_total"][i]
+            scalars[f"dominion/unspent_coins_sum_p{i}"] = snap["unspent_coins_sum"][i]
+            scalars[f"dominion/avg_actions_played_action_phase_p{i}"] = snap["avg_actions_played_in_action_phase"][i]
+
+        scalars["dominion/full_turns"] = snap["full_turns"]
+        scalars["dominion/ended_by_provinces"] = snap["ended_by_provinces"]
+        scalars["dominion/ended_by_3_piles"] = snap["ended_by_3_piles"]
+        return scalars
+
 
     def close(self):
         pass
@@ -469,6 +595,15 @@ class AdapterGame(AbstractGame):
         self.last_actor = cur
         phase = self.dom.phase
 
+        # --- track action-phase start / action plays ---
+        if self._tb_stats is not None:
+            tp = self.dom.turn_player  # чей сейчас ход
+            # фиксируем начало action-фазы (1 раз на фазу)
+            if phase == TurnPhase.ACTION and self.dom.actions == 1 and self.dom.buys >= 1 and self.dom.coins == 0:
+                # это эвристика; если есть более точный сигнал "entered phase" — лучше использовать его
+                self._tb_stats["action_phases_count"][tp] += 1
+                self._tb_stats["actions_played_this_action_phase"][tp] = 0
+
         # --- Potential до действия (Phi_before) ---
         phi_before = self._state_potential(cur)
 
@@ -494,10 +629,12 @@ class AdapterGame(AbstractGame):
 
         # -------------- End turn --------------
         elif action == ACTION_END_TURN:
+            tp_before = self.dom.turn_player
+            coins_before = float(self.dom.coins)
             ok = (phase == TurnPhase.BUY) and self.dom.end_turn_and_advance()
-            if ok:
-                # новый полный ход (переход к следующему игроку)
-                self.turn_number += 1
+            if ok and self._tb_stats is not None:
+                self._tb_stats["full_turns"] += 1
+                self._tb_stats["unspent_coins_sum"][tp_before] += coins_before
 
         # штраф за нелегальное действие
         if not ok:
@@ -518,6 +655,16 @@ class AdapterGame(AbstractGame):
             done = True
             reward += self._terminal_reward_for_last_actor()
 
+            if self._tb_stats is not None:
+                # конец по Province pile?
+                prov_left = int(self.dom.supply.get("Province", 9999))
+                if prov_left <= 0:
+                    self._tb_stats["ended_by_provinces"] = 1
+                # конец по 3 пустым поставкам
+                empty_piles = sum(1 for _, left in self.dom.supply.items() if int(left) <= 0)
+                if empty_piles >= 3:
+                    self._tb_stats["ended_by_3_piles"] = 1
+
         obs = self.get_observation()
         return obs, float(reward), bool(done)
 
@@ -528,7 +675,14 @@ class AdapterGame(AbstractGame):
 
         if phase == TurnPhase.ACTION:
             idx = self._find_index_by_name(p.hand, name, lambda c: c.has_type(CardType.ACTION))
-            return False if idx is None else self.dom.play_action_from_hand(player, idx)
+            if idx is None:
+                return False
+            ok = self.dom.play_action_from_hand(player, idx)
+            if ok and self._tb_stats is not None:
+                tp = self.dom.turn_player
+                self._tb_stats["actions_played_total"][tp] += 1
+                self._tb_stats["actions_played_this_action_phase"][tp] += 1
+            return ok
 
         if phase == TurnPhase.BUY:
             idx = self._find_index_by_name(p.hand, name, lambda c: c.has_type(CardType.TREASURE))

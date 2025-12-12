@@ -262,11 +262,32 @@ class MuZero:
             "num_played_games",
             "num_played_steps",
             "num_reanalysed_games",
+
+            # ---- Dominion TensorBoard metrics (added) ----
+            "dominion/vp_p0",
+            "dominion/vp_p1",
+            "dominion/provinces_p0",
+            "dominion/provinces_p1",
+            "dominion/cards_total_p0",
+            "dominion/cards_total_p1",
+            "dominion/full_turns",
+            "dominion/treasure_value_per_card_p0",
+            "dominion/treasure_value_per_card_p1",
+            "dominion/kingdom_cards_total_p0",
+            "dominion/kingdom_cards_total_p1",
+            "dominion/unspent_coins_sum_p0",
+            "dominion/unspent_coins_sum_p1",
+            "dominion/avg_actions_played_action_phase_p0",
+            "dominion/avg_actions_played_action_phase_p1",
+            "dominion/ended_by_provinces",
+            "dominion/ended_by_3_piles",
         ]
-        info = ray.get(self.shared_storage_worker.get_info.remote(keys))
+        raw = ray.get(self.shared_storage_worker.get_checkpoint.remote())
+        info = {k: raw.get(k, None) for k in keys}
         try:
             while info["training_step"] < self.config.training_steps:
-                info = ray.get(self.shared_storage_worker.get_info.remote(keys))
+                raw = ray.get(self.shared_storage_worker.get_checkpoint.remote())
+                info = {k: raw.get(k, None) for k in keys}
                 writer.add_scalar(
                     "1.Total_reward/1.Total_reward",
                     info["total_reward"],
@@ -320,6 +341,11 @@ class MuZero:
                 writer.add_scalar("3.Loss/Value_loss", info["value_loss"], counter)
                 writer.add_scalar("3.Loss/Reward_loss", info["reward_loss"], counter)
                 writer.add_scalar("3.Loss/Policy_loss", info["policy_loss"], counter)
+
+                # --- Dominion scalars (auto-discover) ---
+                for k, v in raw.items():
+                    if isinstance(k, str) and k.startswith("dominion/") and isinstance(v, (int, float)):
+                        writer.add_scalar(f"4.Dominion/{k}", v, counter)
                 print(
                     f'Last test reward: {info["total_reward"]:.2f}. Training step: {info["training_step"]}/{self.config.training_steps}. Played games: {info["num_played_games"]}. Loss: {info["total_loss"]:.2f}',
                     end="\r",

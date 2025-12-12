@@ -138,7 +138,7 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         self.action_space_size = action_space_size
         self.full_support_size = 2 * support_size + 1
 
-        self.representation_network = (
+        self.representation_network = safe_data_parallel(
             mlp(
                 observation_shape[0]
                 * observation_shape[1]
@@ -150,21 +150,21 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
             )
         )
 
-        self.dynamics_encoded_state_network = (
+        self.dynamics_encoded_state_network = safe_data_parallel(
             mlp(
                 encoding_size + self.action_space_size,
                 fc_dynamics_layers,
                 encoding_size,
             )
         )
-        self.dynamics_reward_network = (
+        self.dynamics_reward_network = safe_data_parallel(
             mlp(encoding_size, fc_reward_layers, self.full_support_size)
         )
 
-        self.prediction_policy_network = (
+        self.prediction_policy_network = safe_data_parallel(
             mlp(encoding_size, fc_policy_layers, self.action_space_size)
         )
-        self.prediction_value_network = (
+        self.prediction_value_network = safe_data_parallel(
             mlp(encoding_size, fc_value_layers, self.full_support_size)
         )
 
@@ -526,7 +526,7 @@ class MuZeroResidualNetwork(AbstractNetwork):
             else (reduced_channels_policy * observation_shape[1] * observation_shape[2])
         )
 
-        self.representation_network = (
+        self.representation_network = safe_data_parallel(
             RepresentationNetwork(
                 observation_shape,
                 stacked_observations,
@@ -536,7 +536,7 @@ class MuZeroResidualNetwork(AbstractNetwork):
             )
         )
 
-        self.dynamics_network = (
+        self.dynamics_network = safe_data_parallel(
             DynamicsNetwork(
                 num_blocks,
                 num_channels + 1,
@@ -547,7 +547,7 @@ class MuZeroResidualNetwork(AbstractNetwork):
             )
         )
 
-        self.prediction_network = (
+        self.prediction_network = safe_data_parallel(
             PredictionNetwork(
                 action_space_size,
                 num_blocks,

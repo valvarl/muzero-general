@@ -71,6 +71,21 @@ class SelfPlay:
                         ),
                     }
                 )
+                # --- Dominion TensorBoard scalars ---
+                if hasattr(game_history, "tensorboard_scalars") and game_history.tensorboard_scalars is not None:
+                    tb_step = ray.get(shared_storage.get_info.remote("training_step"))
+
+                    payload = {}
+                    for k, v in game_history.tensorboard_scalars.items():
+                        # страховка: только числа
+                        if isinstance(v, (int, float)):
+                            payload[k] = v
+
+                    # optional: шаг логирования
+                    payload["dominion/step"] = tb_step
+
+                    shared_storage.set_info.remote(payload)
+
                 if 1 < len(self.config.players):
                     shared_storage.set_info.remote(
                         {
@@ -179,6 +194,14 @@ class SelfPlay:
                 game_history.observation_history.append(observation)
                 game_history.reward_history.append(reward)
                 game_history.to_play_history.append(self.game.to_play())
+
+        # --- Dominion extra stats for TensorBoard ---
+        if (done or len(game_history.action_history) > self.config.max_moves) and hasattr(self.game, "get_episode_tensorboard_scalars"):
+            try:
+                game_history.tensorboard_scalars = self.game.get_episode_tensorboard_scalars()
+            except Exception:
+                # чтобы self-play не падал из-за метрик
+                game_history.tensorboard_scalars = None
 
         return game_history
 
